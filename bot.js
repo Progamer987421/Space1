@@ -1,5 +1,4 @@
 const mineflayer = require('mineflayer')
-const mineflayerBungeecord = require('mineflayer-bungeecord')
 const { Client, GatewayIntentBits, EmbedBuilder, REST, Routes, SlashCommandBuilder } = require('discord.js')
 const http = require('http')
 require('dotenv').config()
@@ -88,13 +87,8 @@ function createBot() {
     version: MC_VERSION,
     auth: 'offline',
     hideErrors: false,
-    checkTimeoutInterval: 30000,
-    connect: (client) => {
-      mineflayerBungeecord.connect(client, MC_HOST, MC_PORT)
-    }
+    checkTimeoutInterval: 30000
   })
-
-  mc.loadPlugin(mineflayerBungeecord)
 
   mc.on('login', () => {
     reconnectDelay = 15000
