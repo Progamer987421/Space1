@@ -3,7 +3,7 @@ const { Client, GatewayIntentBits, EmbedBuilder, REST, Routes, SlashCommandBuild
 const http = require('http')
 require('dotenv').config()
 
-// ─── Config (all from environment variables) ───────────────────────────────
+// ─── Config ────────────────────────────────────────────────────────────────
 const DISCORD_TOKEN = process.env.DISCORD_TOKEN
 const CLIENT_ID     = process.env.CLIENT_ID
 const GUILD_ID      = process.env.GUILD_ID
@@ -13,23 +13,31 @@ const MC_HOST       = process.env.MC_HOST
 const MC_PORT       = parseInt(process.env.MC_PORT || '25565')
 const MC_VERSION    = process.env.MC_VERSION || '1.20.1'
 
-// ─── Validate required env vars ────────────────────────────────────────────
+// ─── Validate ──────────────────────────────────────────────────────────────
 const required = { DISCORD_TOKEN, CLIENT_ID, GUILD_ID, CHANNEL_ID, OWNER_ID, MC_HOST }
 const missing = Object.entries(required).filter(([, v]) => !v).map(([k]) => k)
 if (missing.length > 0) {
-  console.error(`[ERROR] Missing environment variables: ${missing.join(', ')}`)
-  console.error('[ERROR] Create a .env file or set these in Railway Variables.')
+  console.error(`[ERROR] Missing env vars: ${missing.join(', ')}`)
   process.exit(1)
 }
 
 // ─── Keep Railway alive ────────────────────────────────────────────────────
 http.createServer((req, res) => res.end('ok')).listen(process.env.PORT || 3000)
 
-// ─── Custom Username Pool ──────────────────────────────────────────────────
+// ─── Usernames ─────────────────────────────────────────────────────────────
 const MC_USERNAMES = ['ShadowRelay','GhostBridge','NullWatcher','VoidLink','EchoNode']
 function pickUsername() { return MC_USERNAMES[Math.floor(Math.random() * MC_USERNAMES.length)] }
 
-// ─── Slash Command Definitions ─────────────────────────────────────────────
+// ─── Load BungeeCord plugin ────────────────────────────────────────────────
+let bungeecord = null
+try {
+  bungeecord = require('mineflayer-bungeecord')
+  console.log('[MC] BungeeCord plugin loaded')
+} catch (e) {
+  console.warn('[MC] BungeeCord plugin not found — connecting without it')
+}
+
+// ─── Slash Commands ────────────────────────────────────────────────────────
 const commands = [
   new SlashCommandBuilder().setName('say').setDescription('Send a chat message in-game')
     .addStringOption(o => o.setName('message').setDescription('Message to send').setRequired(true)),
@@ -57,7 +65,6 @@ const commands = [
   new SlashCommandBuilder().setName('help').setDescription('List all commands'),
 ].map(c => c.toJSON())
 
-// ─── Register Slash Commands ───────────────────────────────────────────────
 async function registerCommands() {
   const rest = new REST({ version: '10' }).setToken(DISCORD_TOKEN)
   try {
@@ -75,12 +82,12 @@ const discord = new Client({
 let mc = null, channel = null, reconnectTimer = null, reconnectDelay = 15000
 let currentUsername = pickUsername()
 
-// ─── Minecraft Bot Factory ─────────────────────────────────────────────────
+// ─── Minecraft Bot ─────────────────────────────────────────────────────────
 function createBot() {
   if (reconnectTimer) { clearTimeout(reconnectTimer); reconnectTimer = null }
   currentUsername = pickUsername()
 
-  mc = mineflayer.createBot({
+  const botOptions = {
     host: MC_HOST,
     port: MC_PORT,
     username: currentUsername,
@@ -88,7 +95,18 @@ function createBot() {
     auth: 'offline',
     hideErrors: false,
     checkTimeoutInterval: 30000
-  })
+  }
+
+  // Wire BungeeCord handshake if plugin loaded
+  if (bungeecord) {
+    botOptions.connect = (client) => {
+      bungeecord.connect(client, MC_HOST, MC_PORT)
+    }
+  }
+
+  mc = mineflayer.createBot(botOptions)
+
+  if (bungeecord) mc.loadPlugin(bungeecord)
 
   mc.on('login', () => {
     reconnectDelay = 15000
@@ -109,19 +127,19 @@ function createBot() {
 
   mc.on('kicked', (reason) => {
     console.log(`[MC] Kicked: ${reason}`)
-    sendToDiscord(`⚠️ **Bot was kicked**: ${reason}\nReconnecting in ${reconnectDelay / 1000}s...`)
+    sendToDiscord(`⚠️ **Kicked**: ${reason}\nReconnecting in ${reconnectDelay / 1000}s...`)
     scheduleReconnect()
   })
 
   mc.on('end', (reason) => {
-    console.log(`[MC] Connection ended: ${reason}`)
-    sendToDiscord(`🔴 **Bot disconnected** (${reason || 'unknown'}). Reconnecting in ${reconnectDelay / 1000}s...`)
+    console.log(`[MC] Ended: ${reason}`)
+    sendToDiscord(`🔴 **Disconnected** (${reason || 'unknown'}). Reconnecting in ${reconnectDelay / 1000}s...`)
     scheduleReconnect()
   })
 
   mc.on('error', (err) => {
     console.error(`[MC ERROR] ${err.message}`)
-    sendToDiscord(`❌ **MC Error**: ${err.message}`)
+    sendToDiscord(`❌ **Error**: ${err.message}`)
   })
 
   mc.on('death', () => { mc.respawn(); sendToDiscord(`💀 **Bot died** — respawning`) })
@@ -133,7 +151,6 @@ function scheduleReconnect() {
   reconnectTimer = setTimeout(() => {
     reconnectTimer = null
     reconnectDelay = Math.min(reconnectDelay * 2, 120000)
-    console.log('[MC] Reconnecting...')
     createBot()
   }, reconnectDelay)
 }
@@ -253,11 +270,11 @@ discord.on('interactionCreate', async (interaction) => {
   }
 })
 
-// ─── Discord Ready ─────────────────────────────────────────────────────────
+// ─── Ready ─────────────────────────────────────────────────────────────────
 discord.once('ready', async () => {
   console.log(`[Discord] Logged in as ${discord.user.tag}`)
   channel = discord.channels.cache.get(CHANNEL_ID)
-  if (!channel) console.error('[Discord] Channel not found — check CHANNEL_ID')
+  if (!channel) console.error('[Discord] Channel not found')
   await registerCommands()
   createBot()
 })
