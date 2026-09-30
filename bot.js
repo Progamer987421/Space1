@@ -187,21 +187,37 @@ function createBot(username, botId) {
 
   mc.on('end', () => {
     if (!bots.has(botId)) return
-    // If flagged as a Bungeecord transfer, the kicked handler already queued reconnect
+    // Bungeecord transfer: kicked handler already queued a fast reconnect, skip the slow one
     if (entry.transferring) {
       entry.transferring = false
       return
     }
-    console.log(`[MC][${botId}] Connection ended`)
+    // Everything else — timeout, ECONNRESET, server restart, normal disconnect — goes here
+    console.log(`[MC][${botId}] Connection ended — reconnecting in ${entry.reconnectDelay / 1000}s`)
     sendToDiscord(`🔴 **[${botId}]** disconnected. Reconnecting in ${entry.reconnectDelay / 1000}s...`)
     scheduleReconnect(botId)
   })
 
   mc.on('error', (err) => {
-    // ECONNRESET during a transfer is normal — Bungeecord drops the TCP connection cleanly
-    if (entry.transferring && err.code === 'ECONNRESET') return
-    console.error(`[MC][${botId}] ${err.message}`)
-    sendToDiscord(`❌ **[${botId}] Error**: ${err.message}`)
+    const msg = err.message || ''
+    // These are all expected disconnects — mineflayer fires 'error' before 'end' for these.
+    // Let the 'end' handler (or the kicked handler) own the reconnect. Don't double-report.
+    const isExpected = (
+      entry.transferring ||
+      err.code === 'ECONNRESET' ||
+      err.code === 'ECONNREFUSED' ||
+      err.code === 'ETIMEDOUT' ||
+      /timed out/i.test(msg) ||
+      /client timed out/i.test(msg) ||
+      /connection reset/i.test(msg) ||
+      /read ECONNRESET/i.test(msg)
+    )
+    if (isExpected) {
+      console.log(`[MC][${botId}] Expected disconnect (${msg || err.code}) — reconnect queued`)
+      return
+    }
+    console.error(`[MC][${botId}] ${msg}`)
+    sendToDiscord(`❌ **[${botId}] Error**: ${msg}`)
   })
 
   mc.on('death', () => {
