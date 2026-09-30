@@ -127,7 +127,8 @@ function createBot(username, botId) {
     if (existing.mc) try { existing.mc.end() } catch (_) {}
   }
 
-  const entry = { mc: null, username, reconnectTimer: null, reconnectDelay: 5000 }
+  // transferring: true means the bot is mid-Bungeecord server switch — treat end/kicked as expected
+  const entry = { mc: null, username, reconnectTimer: null, reconnectDelay: 5000, transferring: false }
   bots.set(botId, entry)
 
   const mc = mineflayer.createBot({
@@ -142,6 +143,7 @@ function createBot(username, botId) {
 
   mc.on('login', () => {
     entry.reconnectDelay = 5000
+    entry.transferring   = false
     console.log(`[MC][${botId}] Logged in as ${mc.username}`)
     sendToDiscord(`✅ **[${botId}]** joined \`${MC_HOST}\` as \`${username}\``)
   })
@@ -160,20 +162,44 @@ function createBot(username, botId) {
     }
   })
 
+  // Bungeecord server switches arrive as a kick with "Connecting to <realm>" or similar.
+  // Flag the transfer so the 'end' handler doesn't treat it as a real disconnect.
   mc.on('kicked', (reason) => {
-    console.log(`[MC][${botId}] Kicked: ${reason}`)
-    sendToDiscord(`⚠️ **[${botId}]** kicked: ${reason}\nReconnecting in ${entry.reconnectDelay / 1000}s...`)
-    scheduleReconnect(botId)
+    const reasonStr = typeof reason === 'object' ? JSON.stringify(reason) : String(reason)
+    const isBungeeTransfer = /connecting to|you are already connected|server switch|transferring/i.test(reasonStr)
+
+    if (isBungeeTransfer) {
+      entry.transferring = true
+      console.log(`[MC][${botId}] Bungeecord transfer detected: ${reasonStr}`)
+      sendToDiscord(`🔀 **[${botId}]** switching servers — reconnecting...`)
+      // Reconnect immediately, no backoff — this is an expected transition
+      if (entry.reconnectTimer) clearTimeout(entry.reconnectTimer)
+      entry.reconnectTimer = setTimeout(() => {
+        entry.reconnectTimer = null
+        createBot(entry.username, botId)
+      }, 2000)
+    } else {
+      console.log(`[MC][${botId}] Kicked: ${reasonStr}`)
+      sendToDiscord(`⚠️ **[${botId}]** kicked: ${reasonStr}\nReconnecting in ${entry.reconnectDelay / 1000}s...`)
+      scheduleReconnect(botId)
+    }
   })
 
   mc.on('end', () => {
     if (!bots.has(botId)) return
+    // If flagged as a Bungeecord transfer, the kicked handler already queued reconnect
+    if (entry.transferring) {
+      entry.transferring = false
+      return
+    }
     console.log(`[MC][${botId}] Connection ended`)
     sendToDiscord(`🔴 **[${botId}]** disconnected. Reconnecting in ${entry.reconnectDelay / 1000}s...`)
     scheduleReconnect(botId)
   })
 
   mc.on('error', (err) => {
+    // ECONNRESET during a transfer is normal — Bungeecord drops the TCP connection cleanly
+    if (entry.transferring && err.code === 'ECONNRESET') return
     console.error(`[MC][${botId}] ${err.message}`)
     sendToDiscord(`❌ **[${botId}] Error**: ${err.message}`)
   })
