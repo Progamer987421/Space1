@@ -12,6 +12,7 @@ const OWNER_ID      = process.env.OWNER_ID
 const MC_HOST       = process.env.MC_HOST
 const MC_PORT       = parseInt(process.env.MC_PORT || '25565')
 const MC_VERSION    = process.env.MC_VERSION || '1.20.1'
+const MAX_BOTS      = parseInt(process.env.MAX_BOTS || '10')
 
 // ─── Validate ──────────────────────────────────────────────────────────────
 const required = { DISCORD_TOKEN, CLIENT_ID, GUILD_ID, CHANNEL_ID, OWNER_ID, MC_HOST }
@@ -24,11 +25,25 @@ if (missing.length > 0) {
 // ─── Keep Railway alive ────────────────────────────────────────────────────
 http.createServer((req, res) => res.end('ok')).listen(process.env.PORT || 3000)
 
-// ─── Usernames ─────────────────────────────────────────────────────────────
-const MC_USERNAMES = ['ShadowRelay','GhostBridge','NullWatcher','VoidLink','EchoNode']
-function pickUsername() { return MC_USERNAMES[Math.floor(Math.random() * MC_USERNAMES.length)] }
+// ─── Username Pool ─────────────────────────────────────────────────────────
+const USERNAME_POOL = [
+  'ShadowRelay', 'GhostBridge', 'NullWatcher', 'VoidLink', 'EchoNode',
+  'DarkPulse',   'IronCloak',   'StealthNet',  'PhantomX', 'CipherOne',
+  'NightCrawl',  'ByteShift',   'GlitchCore',  'ZeroTrace','SilentDrop'
+]
 
-// ─── Load BungeeCord plugin ────────────────────────────────────────────────
+function pickUsername() {
+  const taken = new Set([...bots.keys()])
+  const available = USERNAME_POOL.filter(u => !taken.has(u))
+  if (available.length === 0) return `Bot_${Date.now().toString(36)}`
+  return available[Math.floor(Math.random() * available.length)]
+}
+
+// ─── Bot Store ─────────────────────────────────────────────────────────────
+// Map<username, { mc, reconnectTimer, reconnectDelay, active }>
+const bots = new Map()
+
+// ─── BungeeCord (optional) ─────────────────────────────────────────────────
 let bungeecord = null
 try {
   bungeecord = require('mineflayer-bungeecord')
@@ -39,14 +54,32 @@ try {
 
 // ─── Slash Commands ────────────────────────────────────────────────────────
 const commands = [
-  new SlashCommandBuilder().setName('say').setDescription('Send a chat message in-game')
-    .addStringOption(o => o.setName('message').setDescription('Message to send').setRequired(true)),
+  new SlashCommandBuilder().setName('addbot').setDescription('Spawn a new bot on the MC server (owner only)')
+    .addIntegerOption(o => o.setName('count').setDescription('How many bots to add (default 1, max 10)').setRequired(false)),
+
+  new SlashCommandBuilder().setName('removebot').setDescription('Disconnect a specific bot (owner only)')
+    .addStringOption(o => o.setName('username').setDescription('Bot username to remove').setRequired(true)),
+
+  new SlashCommandBuilder().setName('removeall').setDescription('Disconnect all bots (owner only)'),
+
+  new SlashCommandBuilder().setName('listbots').setDescription('List all active bots'),
+
+  new SlashCommandBuilder().setName('say').setDescription('Send chat message from all bots (or one specific bot)')
+    .addStringOption(o => o.setName('message').setDescription('Message to send').setRequired(true))
+    .addStringOption(o => o.setName('bot').setDescription('Specific bot username (optional)').setRequired(false)),
+
   new SlashCommandBuilder().setName('players').setDescription('List online players'),
-  new SlashCommandBuilder().setName('pos').setDescription('Show bot current position'),
-  new SlashCommandBuilder().setName('health').setDescription('Show bot health and food'),
-  new SlashCommandBuilder().setName('inventory').setDescription('Show bot inventory'),
-  new SlashCommandBuilder().setName('jump').setDescription('Make the bot jump (owner only)'),
-  new SlashCommandBuilder().setName('walk').setDescription('Move the bot (owner only)')
+
+  new SlashCommandBuilder().setName('pos').setDescription('Show a bot position')
+    .addStringOption(o => o.setName('bot').setDescription('Bot username (defaults to first bot)').setRequired(false)),
+
+  new SlashCommandBuilder().setName('health').setDescription('Show a bot health and food')
+    .addStringOption(o => o.setName('bot').setDescription('Bot username (defaults to first bot)').setRequired(false)),
+
+  new SlashCommandBuilder().setName('jump').setDescription('Make a bot jump (owner only)')
+    .addStringOption(o => o.setName('bot').setDescription('Bot username (defaults to first bot)').setRequired(false)),
+
+  new SlashCommandBuilder().setName('walk').setDescription('Move a bot (owner only)')
     .addStringOption(o => o.setName('direction').setDescription('Direction').setRequired(true)
       .addChoices(
         { name: 'Forward', value: 'forward' },
@@ -54,14 +87,23 @@ const commands = [
         { name: 'Left',    value: 'left'    },
         { name: 'Right',   value: 'right'   }
       ))
-    .addIntegerOption(o => o.setName('duration').setDescription('Duration in ms (default 2000)').setRequired(false)),
-  new SlashCommandBuilder().setName('stop').setDescription('Stop all bot movement (owner only)'),
+    .addIntegerOption(o => o.setName('duration').setDescription('Duration in ms (default 2000)').setRequired(false))
+    .addStringOption(o => o.setName('bot').setDescription('Bot username (defaults to first bot)').setRequired(false)),
+
+  new SlashCommandBuilder().setName('stop').setDescription('Stop all movement on a bot (owner only)')
+    .addStringOption(o => o.setName('bot').setDescription('Bot username — omit for all bots').setRequired(false)),
+
   new SlashCommandBuilder().setName('follow').setDescription('Follow a player (owner only)')
-    .addStringOption(o => o.setName('username').setDescription('Player to follow').setRequired(true)),
+    .addStringOption(o => o.setName('username').setDescription('Player to follow').setRequired(true))
+    .addStringOption(o => o.setName('bot').setDescription('Bot username (defaults to first bot)').setRequired(false)),
+
   new SlashCommandBuilder().setName('look').setDescription('Look at a player')
-    .addStringOption(o => o.setName('username').setDescription('Player to look at').setRequired(true)),
-  new SlashCommandBuilder().setName('reconnect').setDescription('Reconnect the MC bot (owner only)'),
-  new SlashCommandBuilder().setName('username').setDescription('Show the bot current MC username'),
+    .addStringOption(o => o.setName('username').setDescription('Player to look at').setRequired(true))
+    .addStringOption(o => o.setName('bot').setDescription('Bot username (defaults to first bot)').setRequired(false)),
+
+  new SlashCommandBuilder().setName('reconnect').setDescription('Reconnect a bot (owner only)')
+    .addStringOption(o => o.setName('bot').setDescription('Bot username — omit for all bots').setRequired(false)),
+
   new SlashCommandBuilder().setName('help').setDescription('List all commands'),
 ].map(c => c.toJSON())
 
@@ -79,44 +121,64 @@ const discord = new Client({
   intents: [GatewayIntentBits.Guilds, GatewayIntentBits.GuildMessages, GatewayIntentBits.MessageContent]
 })
 
-let mc = null, channel = null, reconnectTimer = null, reconnectDelay = 15000
-let currentUsername = pickUsername()
+let channel = null
 
-// ─── Minecraft Bot ─────────────────────────────────────────────────────────
-function createBot() {
-  if (reconnectTimer) { clearTimeout(reconnectTimer); reconnectTimer = null }
-  currentUsername = pickUsername()
+function sendToDiscord(msg) { if (channel) channel.send(msg).catch(() => {}) }
+function isOwner(i) { return i.user.id === OWNER_ID }
+
+// ─── Get first active bot ──────────────────────────────────────────────────
+function firstBot() {
+  for (const [, entry] of bots) {
+    if (entry.active && entry.mc) return entry.mc
+  }
+  return null
+}
+
+function getBot(username) {
+  if (!username) return firstBot()
+  const entry = bots.get(username)
+  return entry && entry.active ? entry.mc : null
+}
+
+// ─── Create One Bot ────────────────────────────────────────────────────────
+function createBot(username) {
+  if (bots.has(username)) {
+    const existing = bots.get(username)
+    if (existing.reconnectTimer) { clearTimeout(existing.reconnectTimer); existing.reconnectTimer = null }
+  }
+
+  const entry = bots.get(username) || { mc: null, reconnectTimer: null, reconnectDelay: 15000, active: true }
+  entry.active = true
+  bots.set(username, entry)
 
   const botOptions = {
     host: MC_HOST,
     port: MC_PORT,
-    username: currentUsername,
+    username,
     version: MC_VERSION,
     auth: 'offline',
     hideErrors: false,
     checkTimeoutInterval: 30000
   }
 
-  // Wire BungeeCord handshake if plugin loaded
   if (bungeecord) {
-    botOptions.connect = (client) => {
-      bungeecord.connect(client, MC_HOST, MC_PORT)
-    }
+    botOptions.connect = (client) => bungeecord.connect(client, MC_HOST, MC_PORT)
   }
 
-  mc = mineflayer.createBot(botOptions)
+  const mc = mineflayer.createBot(botOptions)
+  entry.mc = mc
 
   if (bungeecord) mc.loadPlugin(bungeecord)
 
   mc.on('login', () => {
-    reconnectDelay = 15000
-    console.log(`[MC] Logged in as ${mc.username}`)
-    sendToDiscord(`✅ **Bot joined** \`${MC_HOST}\` as \`${currentUsername}\``)
+    entry.reconnectDelay = 15000
+    console.log(`[MC] ${username} logged in`)
+    sendToDiscord(`✅ **${username}** joined \`${MC_HOST}\``)
   })
 
-  mc.on('chat', (username, message) => {
-    if (username === mc.username) return
-    if (channel) channel.send(`💬 **${username}**: ${message}`).catch(() => {})
+  mc.on('chat', (sender, message) => {
+    if (sender === username) return
+    if (channel) channel.send(`💬 **${sender}**: ${message}`).catch(() => {})
   })
 
   mc.on('message', (jsonMsg) => {
@@ -126,37 +188,49 @@ function createBot() {
   })
 
   mc.on('kicked', (reason) => {
-    console.log(`[MC] Kicked: ${reason}`)
-    sendToDiscord(`⚠️ **Kicked**: ${reason}\nReconnecting in ${reconnectDelay / 1000}s...`)
-    scheduleReconnect()
+    console.log(`[MC] ${username} kicked: ${reason}`)
+    sendToDiscord(`⚠️ **${username}** kicked: ${reason}`)
+    if (entry.active) scheduleReconnect(username)
   })
 
   mc.on('end', (reason) => {
-    console.log(`[MC] Ended: ${reason}`)
-    sendToDiscord(`🔴 **Disconnected** (${reason || 'unknown'}). Reconnecting in ${reconnectDelay / 1000}s...`)
-    scheduleReconnect()
+    console.log(`[MC] ${username} disconnected: ${reason}`)
+    if (entry.active) {
+      sendToDiscord(`🔴 **${username}** disconnected (${reason || 'unknown'}). Reconnecting in ${entry.reconnectDelay / 1000}s...`)
+      scheduleReconnect(username)
+    }
   })
 
   mc.on('error', (err) => {
-    console.error(`[MC ERROR] ${err.message}`)
-    sendToDiscord(`❌ **Error**: ${err.message}`)
+    console.error(`[MC ERROR] ${username}: ${err.message}`)
+    sendToDiscord(`❌ **${username}** error: ${err.message}`)
   })
 
-  mc.on('death', () => { mc.respawn(); sendToDiscord(`💀 **Bot died** — respawning`) })
-  mc.on('spawn', () => console.log('[MC] Bot spawned'))
+  mc.on('death', () => { mc.respawn(); sendToDiscord(`💀 **${username}** died — respawning`) })
+  mc.on('spawn', () => console.log(`[MC] ${username} spawned`))
 }
 
-function scheduleReconnect() {
-  if (reconnectTimer) return
-  reconnectTimer = setTimeout(() => {
-    reconnectTimer = null
-    reconnectDelay = Math.min(reconnectDelay * 2, 120000)
-    createBot()
-  }, reconnectDelay)
+function scheduleReconnect(username) {
+  const entry = bots.get(username)
+  if (!entry || entry.reconnectTimer) return
+  entry.reconnectTimer = setTimeout(() => {
+    entry.reconnectTimer = null
+    entry.reconnectDelay = Math.min(entry.reconnectDelay * 2, 120000)
+    if (entry.active) createBot(username)
+  }, entry.reconnectDelay)
 }
 
-function sendToDiscord(msg) { if (channel) channel.send(msg).catch(() => {}) }
-function isOwner(i) { return i.user.id === OWNER_ID }
+function removeBot(username) {
+  const entry = bots.get(username)
+  if (!entry) return false
+  entry.active = false
+  if (entry.reconnectTimer) { clearTimeout(entry.reconnectTimer); entry.reconnectTimer = null }
+  if (entry.mc) {
+    try { entry.mc.end() } catch (e) {}
+  }
+  bots.delete(username)
+  return true
+}
 
 // ─── Slash Command Handler ─────────────────────────────────────────────────
 discord.on('interactionCreate', async (interaction) => {
@@ -165,42 +239,109 @@ discord.on('interactionCreate', async (interaction) => {
     return interaction.reply({ content: '❌ Wrong channel.', ephemeral: true })
 
   const { commandName } = interaction
-  const ownerOnly = ['stop','reconnect','jump','walk','follow']
+  const ownerOnly = ['addbot','removebot','removeall','stop','reconnect','jump','walk','follow']
 
   if (ownerOnly.includes(commandName) && !isOwner(interaction))
     return interaction.reply({ content: '❌ Owner only.', ephemeral: true })
 
-  if (!mc && commandName !== 'reconnect')
-    return interaction.reply({ content: '❌ MC bot not connected.', ephemeral: true })
-
   switch (commandName) {
-    case 'say': {
-      const text = interaction.options.getString('message')
-      mc.chat(text)
-      await interaction.reply({ content: `✅ Sent: **${text}**`, ephemeral: true })
+
+    case 'addbot': {
+      const count = Math.min(interaction.options.getInteger('count') || 1, 10)
+      const available = MAX_BOTS - bots.size
+      if (available <= 0)
+        return interaction.reply(`❌ Max bots reached (${MAX_BOTS}). Use \`/removebot\` first.`)
+      const toAdd = Math.min(count, available)
+      const added = []
+      for (let i = 0; i < toAdd; i++) {
+        const username = pickUsername()
+        createBot(username)
+        added.push(username)
+      }
+      await interaction.reply(`✅ Spawning **${added.length}** bot(s): ${added.map(u => `\`${u}\``).join(', ')}`)
       break
     }
+
+    case 'removebot': {
+      const username = interaction.options.getString('username')
+      const removed = removeBot(username)
+      await interaction.reply(removed ? `✅ **${username}** disconnected.` : `❌ Bot \`${username}\` not found.`)
+      break
+    }
+
+    case 'removeall': {
+      const names = [...bots.keys()]
+      names.forEach(removeBot)
+      await interaction.reply(`✅ Disconnected **${names.length}** bot(s).`)
+      break
+    }
+
+    case 'listbots': {
+      if (bots.size === 0) return interaction.reply('No bots connected.')
+      const lines = [...bots.entries()].map(([name, entry]) =>
+        `• \`${name}\` — ${entry.active ? '🟢 active' : '🔴 reconnecting'}`
+      )
+      const embed = new EmbedBuilder()
+        .setTitle(`🤖 Active Bots (${bots.size}/${MAX_BOTS})`)
+        .setColor(0x2ecc71)
+        .setDescription(lines.join('\n'))
+      await interaction.reply({ embeds: [embed] })
+      break
+    }
+
+    case 'say': {
+      const text = interaction.options.getString('message')
+      const targetName = interaction.options.getString('bot')
+      if (targetName) {
+        const mc = getBot(targetName)
+        if (!mc) return interaction.reply(`❌ Bot \`${targetName}\` not found.`)
+        mc.chat(text)
+        await interaction.reply({ content: `✅ **${targetName}** sent: **${text}**`, ephemeral: true })
+      } else {
+        let sent = 0
+        for (const [, entry] of bots) {
+          if (entry.active && entry.mc) { entry.mc.chat(text); sent++ }
+        }
+        await interaction.reply({ content: `✅ Sent from **${sent}** bot(s): **${text}**`, ephemeral: true })
+      }
+      break
+    }
+
     case 'players': {
+      const mc = firstBot()
+      if (!mc) return interaction.reply('❌ No bots connected.')
       const players = Object.keys(mc.players)
       await interaction.reply(players.length === 0 ? 'No players online.' : `**Online (${players.length}):** ${players.join(', ')}`)
       break
     }
+
     case 'pos': {
+      const mc = getBot(interaction.options.getString('bot'))
+      if (!mc) return interaction.reply('❌ Bot not found.')
       const p = mc.entity.position
       await interaction.reply(`📍 X: \`${p.x.toFixed(1)}\` Y: \`${p.y.toFixed(1)}\` Z: \`${p.z.toFixed(1)}\``)
       break
     }
+
     case 'health': {
+      const mc = getBot(interaction.options.getString('bot'))
+      if (!mc) return interaction.reply('❌ Bot not found.')
       await interaction.reply(`❤️ **Health:** ${mc.health}/20 | 🍗 **Food:** ${mc.food}/20`)
       break
     }
+
     case 'jump': {
+      const mc = getBot(interaction.options.getString('bot'))
+      if (!mc) return interaction.reply('❌ Bot not found.')
       mc.setControlState('jump', true)
       setTimeout(() => mc.setControlState('jump', false), 500)
       await interaction.reply({ content: '✅ Jumped.', ephemeral: true })
       break
     }
+
     case 'walk': {
+      const mc = getBot(interaction.options.getString('bot'))
+      if (!mc) return interaction.reply('❌ Bot not found.')
       const dir = interaction.options.getString('direction')
       const duration = interaction.options.getInteger('duration') || 2000
       mc.setControlState(dir, true)
@@ -208,13 +349,24 @@ discord.on('interactionCreate', async (interaction) => {
       await interaction.reply(`🚶 Walking **${dir}** for ${duration}ms`)
       break
     }
+
     case 'stop': {
-      ;['forward','back','left','right','jump','sprint','sneak'].forEach(s => mc.setControlState(s, false))
-      if (mc._followInterval) { clearInterval(mc._followInterval); mc._followInterval = null }
-      await interaction.reply({ content: '✅ Stopped.', ephemeral: true })
+      const targetName = interaction.options.getString('bot')
+      const targets = targetName
+        ? (bots.get(targetName) ? [bots.get(targetName)] : [])
+        : [...bots.values()]
+      targets.forEach(entry => {
+        if (!entry.mc) return
+        ;['forward','back','left','right','jump','sprint','sneak'].forEach(s => entry.mc.setControlState(s, false))
+        if (entry.mc._followInterval) { clearInterval(entry.mc._followInterval); entry.mc._followInterval = null }
+      })
+      await interaction.reply({ content: `✅ Stopped ${targetName ? `\`${targetName}\`` : 'all bots'}.`, ephemeral: true })
       break
     }
+
     case 'follow': {
+      const mc = getBot(interaction.options.getString('bot'))
+      if (!mc) return interaction.reply('❌ Bot not found.')
       const target = interaction.options.getString('username')
       const player = mc.players[target]
       if (!player || !player.entity) return interaction.reply(`❌ Can't see \`${target}\``)
@@ -229,7 +381,10 @@ discord.on('interactionCreate', async (interaction) => {
       await interaction.reply(`👣 Following **${target}**. Use \`/stop\` to cancel.`)
       break
     }
+
     case 'look': {
+      const mc = getBot(interaction.options.getString('bot'))
+      if (!mc) return interaction.reply('❌ Bot not found.')
       const target = interaction.options.getString('username')
       const player = mc.players[target]
       if (!player || !player.entity) return interaction.reply(`❌ Can't see \`${target}\``)
@@ -237,32 +392,46 @@ discord.on('interactionCreate', async (interaction) => {
       await interaction.reply({ content: '✅ Looking.', ephemeral: true })
       break
     }
+
     case 'reconnect': {
-      if (mc) mc.end()
-      if (reconnectTimer) { clearTimeout(reconnectTimer); reconnectTimer = null }
-      await interaction.reply('🔄 Reconnecting...')
-      setTimeout(createBot, 1000)
+      const targetName = interaction.options.getString('bot')
+      if (targetName) {
+        const entry = bots.get(targetName)
+        if (!entry) return interaction.reply(`❌ Bot \`${targetName}\` not found.`)
+        if (entry.mc) entry.mc.end()
+        if (entry.reconnectTimer) { clearTimeout(entry.reconnectTimer); entry.reconnectTimer = null }
+        await interaction.reply(`🔄 Reconnecting \`${targetName}\`...`)
+        setTimeout(() => createBot(targetName), 1000)
+      } else {
+        const names = [...bots.keys()]
+        names.forEach(name => {
+          const entry = bots.get(name)
+          if (entry.mc) entry.mc.end()
+          if (entry.reconnectTimer) { clearTimeout(entry.reconnectTimer); entry.reconnectTimer = null }
+          setTimeout(() => createBot(name), 1000)
+        })
+        await interaction.reply(`🔄 Reconnecting **${names.length}** bot(s)...`)
+      }
       break
     }
-    case 'username': {
-      await interaction.reply(`🎮 Connected as \`${currentUsername}\``)
-      break
-    }
+
     case 'help': {
       const embed = new EmbedBuilder().setTitle('🤖 Minecraft Bot Commands').setColor(0x2ecc71)
         .addFields(
-          { name: '/say <msg>',       value: 'Send chat message in-game',         inline: false },
-          { name: '/players',         value: 'List online players',               inline: false },
-          { name: '/pos',             value: 'Bot current position',              inline: false },
-          { name: '/health',          value: 'Bot health and food',               inline: false },
-          { name: '/inventory',       value: 'Show bot inventory',                inline: false },
-          { name: '/username',        value: 'Show current MC username',          inline: false },
-          { name: '/walk <dir> [ms]', value: 'Move bot (owner only)',             inline: false },
-          { name: '/jump',            value: 'Make bot jump (owner only)',        inline: false },
-          { name: '/follow <player>', value: 'Follow a player (owner only)',      inline: false },
-          { name: '/look <player>',   value: 'Look at a player',                 inline: false },
-          { name: '/stop',            value: 'Stop all movement (owner only)',    inline: false },
-          { name: '/reconnect',       value: 'Reconnect to server (owner only)', inline: false },
+          { name: '/addbot [count]',        value: 'Spawn 1-10 bots (owner only)',          inline: false },
+          { name: '/removebot <username>',   value: 'Disconnect a specific bot (owner only)', inline: false },
+          { name: '/removeall',              value: 'Disconnect all bots (owner only)',       inline: false },
+          { name: '/listbots',               value: 'List all active bots',                  inline: false },
+          { name: '/say <msg> [bot]',        value: 'Send chat — all bots or one specific',  inline: false },
+          { name: '/players',                value: 'List online players',                   inline: false },
+          { name: '/pos [bot]',              value: 'Bot position',                          inline: false },
+          { name: '/health [bot]',           value: 'Bot health and food',                   inline: false },
+          { name: '/walk <dir> [ms] [bot]',  value: 'Move bot (owner only)',                 inline: false },
+          { name: '/jump [bot]',             value: 'Make bot jump (owner only)',             inline: false },
+          { name: '/follow <player> [bot]',  value: 'Follow a player (owner only)',          inline: false },
+          { name: '/look <player> [bot]',    value: 'Look at a player',                      inline: false },
+          { name: '/stop [bot]',             value: 'Stop movement — one or all (owner only)', inline: false },
+          { name: '/reconnect [bot]',        value: 'Reconnect — one or all (owner only)',   inline: false },
         )
       await interaction.reply({ embeds: [embed] })
       break
@@ -276,7 +445,8 @@ discord.once('ready', async () => {
   channel = discord.channels.cache.get(CHANNEL_ID)
   if (!channel) console.error('[Discord] Channel not found')
   await registerCommands()
-  createBot()
+  // Spawn one bot on startup
+  createBot(pickUsername())
 })
 
 discord.login(DISCORD_TOKEN)
